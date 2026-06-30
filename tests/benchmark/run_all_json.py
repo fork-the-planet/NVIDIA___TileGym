@@ -74,6 +74,16 @@ def get_gpu_info() -> Dict[str, Any]:
     return gpu_info
 
 
+def _all_numeric(tokens: List[str]) -> bool:
+    """Return True if every token parses as a number (int/float)."""
+    for t in tokens:
+        try:
+            float(t)
+        except ValueError:
+            return False
+    return True
+
+
 def parse_benchmark_output(output: str) -> List[Dict[str, Any]]:
     """
     Parse benchmark output and extract structured data.
@@ -109,13 +119,24 @@ def parse_benchmark_output(output: str) -> List[Dict[str, Any]]:
                 header_row = header_line.split()
                 i += 1
 
-                # Following lines are data rows until we hit empty line or next benchmark
+                # Following lines are data rows until we hit empty line or next benchmark.
+                # Triton perf_report prints a pandas DataFrame whose rows are an integer
+                # RangeIndex (0, 1, 2, ...) followed by exactly one numeric value per header
+                # column (x-axis params and per-backend measurements are all numbers).
+                # Other stdout that may be interleaved before the blank separator -- e.g.
+                # autotuner logs like "namespace(TILE_SIZE_M=128, ...): 17.5±0.2 us" or
+                # "<n> succeeded, 0 failed" -- contains non-numeric tokens, so we keep only
+                # lines whose tokens are an integer index plus all-numeric columns of the
+                # expected width.
+                expected_cols = len(header_row) + 1 if header_row else 0
                 data_rows = []
                 while i < len(lines):
                     data_line = lines[i].strip()
                     if not data_line or data_line.endswith("-TFLOPS:") or data_line.endswith("-GBps:"):
                         break
-                    data_rows.append(data_line.split())
+                    tokens = data_line.split()
+                    if tokens and tokens[0].isdigit() and len(tokens) == expected_cols and _all_numeric(tokens):
+                        data_rows.append(tokens)
                     i += 1
 
                 # Structure the data
@@ -256,13 +277,32 @@ def setup_output_directory() -> Path:
 
 
 def find_benchmark_files() -> List[Path]:
-    """Find all benchmark files recursively under the benchmark directory."""
+    """Find all benchmark files recursively under the benchmark directory.
+
+    Supports optional sharding for parallel CI via environment variables:
+      BENCH_NUM_SHARDS - total number of shards (default 1 = no sharding)
+      BENCH_SHARD      - this shard's index, 1-based
+    Files are assigned round-robin across shards so the mix of small/large
+    benchmarks is spread evenly.
+    """
     benchmark_dir = Path(__file__).parent
     benchmark_files = sorted(benchmark_dir.rglob("bench_*.py"))
 
     if not benchmark_files:
         logger.error("No benchmark files found")
         sys.exit(1)
+
+    num_shards = int(os.environ.get("BENCH_NUM_SHARDS", "1") or "1")
+    shard = int(os.environ.get("BENCH_SHARD", "1") or "1")
+    if num_shards > 1:
+        if not (1 <= shard <= num_shards):
+            logger.error(f"BENCH_SHARD={shard} is out of range 1..{num_shards}")
+            sys.exit(1)
+        selected = benchmark_files[shard - 1 :: num_shards]
+        logger.info(
+            f"Sharding enabled: shard {shard}/{num_shards} -> {len(selected)}/{len(benchmark_files)} benchmark files"
+        )
+        benchmark_files = selected
 
     return benchmark_files
 

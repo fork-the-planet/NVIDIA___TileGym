@@ -281,14 +281,21 @@ jobs:
           /tmp/sanity-env/bin/pip check
 
   test-ops:
-    name: test-ops
+    name: test-ops (shard ${{ matrix.shard }})
     needs: [config, build]
-    timeout-minutes: 40
+    timeout-minutes: 60
     if: |
       always() &&
       needs.config.outputs.run_ops == 'true' &&
       (needs.build.result == 'success' || needs.build.result == 'skipped')
     runs-on: linux-amd64-gpu-rtxpro6000-latest-1
+    strategy:
+      # Shard the ops tests across parallel GPU runners with pytest-split so
+      # wall-clock time stays bounded as the suite grows. Add more shards to
+      # this list to scale out further; --splits tracks strategy.job-total.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     steps:
       - name: Checkout code (sparse - need ops tests and shared utilities)
         uses: actions/checkout@v4
@@ -307,16 +314,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Pull and run ops tests
-        timeout-minutes: 35
+      - name: Pull and run ops tests (shard ${{ matrix.shard }})
+        timeout-minutes: 50
         run: |
           OWNER_LOWER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
           IMAGE="ghcr.io/${OWNER_LOWER}/${{ needs.config.outputs.image_name }}:${{ needs.config.outputs.image_tag }}"
+
+          # PR builds read the committed durations map to balance shards. Nightly
+          # builds (main/schedule) instead record fresh per-test timings to an
+          # uploaded file, which the update-test-durations job merges and commits
+          # back so the committed map stays current as tests are added.
+          if [ "${{ needs.config.outputs.is_pr }}" == "false" ]; then
+            DURATIONS_ARGS="--durations-path /test-results/durations-${{ matrix.shard }}.json --store-durations"
+          else
+            DURATIONS_ARGS="--durations-path /workspace/tilegym/.github/.test_durations"
+          fi
 
           docker pull ${IMAGE}
           docker run --rm \
             --gpus all \
             -e DISABLE_AUTOTUNE=1 \
+            -e PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.8 \
             -v ${{ github.workspace }}/tests:/workspace/tilegym/tests \
             -v ${{ github.workspace }}/test-results:/test-results \
             -w /workspace/tilegym/modeling/transformers \
@@ -324,47 +342,270 @@ jobs:
             uv run --locked --no-sync python -m pytest \
                 /workspace/tilegym/tests/ops /workspace/tilegym/tests/suites \
                 -v -k test_op \
-                -n 12 \
-                --junitxml=/test-results/ops-results.xml \
-                --html=/test-results/ops-report.html \
+                --splits ${{ strategy.job-total }} --group ${{ matrix.shard }} \
+                ${DURATIONS_ARGS} \
+                -n 8 \
+                --junitxml=/test-results/ops-results-${{ matrix.shard }}.xml \
+                --html=/test-results/ops-report-${{ matrix.shard }}.html \
                 --self-contained-html
 
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ops-test-results
-          path: test-results/ops-*
+          name: ops-test-results-${{ matrix.shard }}
+          path: |
+            test-results/ops-*
+            test-results/durations-*.json
           retention-days: 30
 
       - name: Publish test results
         uses: EnricoMi/publish-unit-test-result-action@v2
         if: always()
         with:
-          files: test-results/ops-results.xml
-          check_name: Ops Test Results
+          files: test-results/ops-results-${{ matrix.shard }}.xml
+          check_name: Ops Test Results (shard ${{ matrix.shard }})
           comment_mode: off
 
+  update-test-durations:
+    name: update-test-durations
+    needs: [config, test-ops]
+    # Nightly only: after a successful main/scheduled run, refresh the committed
+    # .github/.test_durations map ONLY when the set of ops tests changed (tests
+    # added or removed) -- pure timing drift is ignored so the file does not
+    # churn nightly. Changes are proposed via a reviewable PR (main is protected
+    # and requires PRs), never pushed to main directly. Reuses the nightly
+    # test-ops run -- no extra GPU time. Skipped on PRs.
+    if: |
+      needs.config.outputs.is_pr == 'false' &&
+      needs.test-ops.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          sparse-checkout: |
+            .github
+          sparse-checkout-cone-mode: false
+
+      - name: Download ops shard results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ops-test-results-*
+          path: ${{ github.workspace }}/ops-artifacts
+
+      - name: Refresh durations only if the test set changed
+        id: refresh
+        run: |
+          python3 - <<'PY'
+          import json, glob, os
+
+          merged = {}
+          files = sorted(glob.glob("ops-artifacts/*/durations-*.json"))
+          for f in files:
+              try:
+                  merged.update(json.load(open(f)))
+              except Exception as e:
+                  print(f"skip {f}: {e}")
+          print(f"collected {len(merged)} test durations from {len(files)} shard file(s)")
+
+          out = ".github/.test_durations"
+          old = {}
+          if os.path.exists(out):
+              old = json.load(open(out))
+
+          def emit(k, v):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+                  fh.write(f"{k}={v}\n")
+
+          if not merged:
+              print("No durations collected; nothing to do.")
+              emit("changed", "false")
+              raise SystemExit(0)
+
+          added = sorted(set(merged) - set(old))
+          removed = sorted(set(old) - set(merged))
+          if not added and not removed:
+              # Only timings drifted (noise) -- do not churn the committed file.
+              print("Test set unchanged; skipping update (timing drift ignored).")
+              emit("changed", "false")
+              raise SystemExit(0)
+
+          print(f"Test set changed: +{len(added)} added, -{len(removed)} removed -> proposing update")
+          for t in added[:20]:
+              print(f"  + {t}")
+          for t in removed[:20]:
+              print(f"  - {t}")
+          merged = {k: merged[k] for k in sorted(merged)}
+          with open(out, "w") as fh:
+              json.dump(merged, fh, indent=0)
+              fh.write("\n")
+          emit("changed", "true")
+          emit("added", str(len(added)))
+          emit("removed", str(len(removed)))
+          PY
+
+      - name: Open / update PR with refreshed durations
+        if: steps.refresh.outputs.changed == 'true'
+        # Best-effort: a refresh-PR hiccup (e.g. PR-creation policy) must never
+        # turn the nightly run red. The committed map stays valid until refreshed.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="ci/update-test-durations"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${BRANCH}"
+          git add .github/.test_durations
+          git commit -m "ci: refresh .test_durations (ops test set changed: +${{ steps.refresh.outputs.added }}/-${{ steps.refresh.outputs.removed }})"
+          # Rolling branch: force-push so an existing PR updates in place.
+          git push -f origin "${BRANCH}"
+          # Build the PR body from the repo's pull_request_template.md, filling in
+          # the Description while preserving the CI Configuration block and Checklist.
+          {
+            echo "## Description"
+            echo "Automated refresh of \`.github/.test_durations\` (pytest-split shard balancing for test-ops)."
+            echo ""
+            echo "Triggered because the **ops test set changed** in the nightly run:"
+            echo "**+${{ steps.refresh.outputs.added }}** test(s) added, **-${{ steps.refresh.outputs.removed }}** removed."
+            echo "Pure timing drift does not trigger this PR. Review and merge to keep the shards balanced."
+            echo ""
+            echo "## CI Configuration"
+            echo '```yaml'
+            echo "config:"
+            echo "  build: false"
+            echo "  # valid options are \"ops\", \"benchmark\", and \"sanity\""
+            echo "  test: []"
+            echo '```'
+            echo ""
+            echo "## Checklist"
+            echo "- [x] Code formatted and imports sorted via repo specifications (\`./format.sh\`) — N/A, data-only change"
+            echo "- [x] Documentation updated (if needed) — N/A"
+            echo "- [ ] CI configuration reviewed"
+          } > pr_body.md
+          if [ -z "$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number')" ]; then
+            gh pr create --base main --head "${BRANCH}" \
+              --title "ci: refresh pytest-split .test_durations" \
+              --body-file pr_body.md
+          else
+            echo "Existing PR for ${BRANCH} updated in place."
+          fi
+
   test-benchmark:
-    name: test-benchmark
+    name: test-benchmark (shard ${{ matrix.shard }})
     needs: [config, build]
-    timeout-minutes: 70
+    timeout-minutes: 90
     if: |
       always() &&
       needs.config.outputs.run_benchmark == 'true' &&
       (needs.build.result == 'success' || needs.build.result == 'skipped')
     runs-on: linux-amd64-gpu-rtxpro6000-latest-1
+    strategy:
+      # Shard benchmark files across parallel GPU runners. run_all_json.py
+      # assigns files round-robin via BENCH_NUM_SHARDS/BENCH_SHARD. Add shards
+      # to this list as more benchmarks/backends are added; BENCH_NUM_SHARDS
+      # tracks strategy.job-total automatically.
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     steps:
-      - name: Checkout code (sparse - need scripts and benchmarks)
+      - name: Checkout code (sparse - need benchmarks)
         uses: actions/checkout@v4
         with:
           sparse-checkout: |
-            .github/scripts
             tests/benchmark
           sparse-checkout-cone-mode: false
 
       - name: Create test results directory
         run: mkdir -p ${{ github.workspace }}/test-results
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull and run benchmarks (shard ${{ matrix.shard }})
+        timeout-minutes: 80
+        run: |
+          OWNER_LOWER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${OWNER_LOWER}/${{ needs.config.outputs.image_name }}:${{ needs.config.outputs.image_tag }}"
+
+          docker pull ${IMAGE}
+          docker run --rm \
+            --gpus all \
+            -e BENCH_NUM_SHARDS=${{ strategy.job-total }} \
+            -e BENCH_SHARD=${{ matrix.shard }} \
+            -v ${{ github.workspace }}/tests/benchmark:/workspace/tilegym/tests/benchmark \
+            -v ${{ github.workspace }}/test-results:/test-results \
+            -w /workspace/tilegym/modeling/transformers \
+            ${IMAGE} \
+            uv run --locked --no-sync bash /workspace/tilegym/tests/benchmark/run_all.sh /test-results --json
+
+      - name: Upload shard benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-shard-results-${{ matrix.shard }}
+          path: test-results/*.json
+          retention-days: 30
+
+  benchmark-aggregate:
+    name: benchmark-aggregate
+    needs: [config, test-benchmark]
+    timeout-minutes: 15
+    if: |
+      always() &&
+      needs.config.outputs.run_benchmark == 'true' &&
+      (needs.test-benchmark.result == 'success' || needs.test-benchmark.result == 'failure')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code (sparse - need scripts)
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Download all shard benchmark results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: benchmark-shard-results-*
+          path: ${{ github.workspace }}/shard-artifacts
+
+      - name: Merge shard results
+        run: |
+          python3 - <<'PY'
+          import json, glob, os, shutil
+          os.makedirs("test-results", exist_ok=True)
+          benches, ts, sysinfo = [], None, None
+          shard_dirs = sorted(glob.glob("shard-artifacts/*/"))
+          print(f"Found {len(shard_dirs)} shard artifact dir(s)")
+          for d in shard_dirs:
+              # Copy each per-benchmark result file (unique names across shards)
+              for f in glob.glob(os.path.join(d, "*_results.json")):
+                  shutil.copy(f, os.path.join("test-results", os.path.basename(f)))
+              # Union the per-shard combined files
+              ab = os.path.join(d, "all_benchmarks.json")
+              if os.path.exists(ab):
+                  data = json.load(open(ab))
+                  benches += data.get("benchmarks", [])
+                  ts = ts or data.get("timestamp")
+              si = os.path.join(d, "system_info.json")
+              if sysinfo is None and os.path.exists(si):
+                  sysinfo = open(si).read()
+          json.dump({"timestamp": ts, "benchmarks": benches},
+                    open("test-results/all_benchmarks.json", "w"), indent=2)
+          if sysinfo:
+              open("test-results/system_info.json", "w").write(sysinfo)
+          print(f"Merged {len(benches)} benchmark file result(s) from {len(shard_dirs)} shard(s)")
+          PY
 
       # Download previous baseline for regression detection
       # Uses GitHub CLI instead of dawidd6 action (more reliable, no third-party dependencies)
@@ -401,28 +642,6 @@ jobs:
           else
             echo "⚠️  No baseline artifact found (this may be the first run)"
           fi
-
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Pull and run benchmarks
-        timeout-minutes: 60
-        run: |
-          OWNER_LOWER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
-          IMAGE="ghcr.io/${OWNER_LOWER}/${{ needs.config.outputs.image_name }}:${{ needs.config.outputs.image_tag }}"
-
-          docker pull ${IMAGE}
-          docker run --rm \
-            --gpus all \
-            -v ${{ github.workspace }}/tests/benchmark:/workspace/tilegym/tests/benchmark \
-            -v ${{ github.workspace }}/test-results:/test-results \
-            -w /workspace/tilegym/modeling/transformers \
-            ${IMAGE} \
-            uv run --locked --no-sync bash /workspace/tilegym/tests/benchmark/run_all.sh /test-results --json
 
       # Compare current results against baseline with three zones:
       # - Regression zone (< -5%): Build fails
@@ -566,6 +785,16 @@ jobs:
               fi
             fi
           fi
+
+      # A benchmark *run* failure (a benchmark errored out) must fail the
+      # pipeline. We run this last so the regression report / summary above
+      # are still produced and uploaded first.
+      - name: Propagate benchmark shard failure
+        if: needs.test-benchmark.result == 'failure'
+        run: |
+          echo "❌ One or more benchmark shards failed (a benchmark errored)."
+          echo "   See the test-benchmark shard logs for details."
+          exit 1
 
   publish-wheel:
     name: publish-verified-wheel
